@@ -5,6 +5,7 @@ import hashlib
 import os
 import time
 from collections import defaultdict, deque, OrderedDict
+import wandb
 
 import torch
 import torch.distributed as dist
@@ -148,6 +149,7 @@ class MetricLogger:
                             i, len(iterable), eta=eta_string, meters=str(self), time=str(iter_time), data=str(data_time)
                         )
                     )
+                wandb.log({"eta_hours": eta_seconds / 3600, "batch_idx": i, "epoch_pct": (i+1) / len(iterable),})
             i += 1
             end = time.time()
         total_time = time.time() - start_time
