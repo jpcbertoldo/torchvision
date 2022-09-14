@@ -18,6 +18,7 @@ from torch.utils.data.dataloader import default_collate
 from torchvision.transforms.functional import InterpolationMode
 import wandb
 
+from pathlib import Path
 
 try:
     from torchvision import prototype
@@ -376,7 +377,7 @@ def main(args):
                 checkpoint["model_ema"] = model_ema.state_dict()
             if scaler:
                 checkpoint["scaler"] = scaler.state_dict()
-            utils.save_on_master(checkpoint, os.path.join(args.output_dir, f"model_{epoch}.pth"))
+            utils.save_on_master(checkpoint, os.path.join(args.output_dir, f"model_{epoch:06d}.pth"))
             utils.save_on_master(checkpoint, os.path.join(args.output_dir, "checkpoint.pth"))
         
         wandb.log({
@@ -526,7 +527,7 @@ def get_extension_parser():
     parser.add_argument("--wandb_entity", required=True, type=str, help="the wandb entity name")
     parser.add_argument("--wandb_project", required=True, type=str, help="the wandb project name")
     parser.add_argument("--wandb_group", required=True, type=str, help="the wandb group name")
-    parser.add_argument("--wandb_dir", required=True, type=str, help="the wandb directory")
+    parser.add_argument("--wandb_dir", required=True, type=Path, help="the wandb directory")
     parser.add_argument("--wandb_tags", type=str, help="the wandb tags", nargs="+")
     parser.add_argument("--seed", required=True, type=int, help="seed for initializing training. ")
     return parser
@@ -540,6 +541,9 @@ if __name__ == "__main__":
     
     torch.manual_seed(extension_args.seed)
     
+    extension_args.wandb_dir.mkdir(parents=True, exist_ok=True)
+    extension_args.wandb_dir = str(extension_args.wandb_dir)
+    
     wandb.init(
         job_type=f"train-model={args.model}",
         project=extension_args.wandb_project,
@@ -551,10 +555,9 @@ if __name__ == "__main__":
         mode="online",
     ) 
     
-    from pathlib import Path
     checkpoints_dir = Path(wandb.run.dir) / "checkpoints"
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
-    wandb.save(str(checkpoints_dir / f"*pth"))   
+    wandb.save(str(checkpoints_dir / f"model*.pth"))   
     args.output_dir = str(checkpoints_dir) 
     
     try:
