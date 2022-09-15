@@ -610,7 +610,7 @@ if __name__ == "__main__":
         if utils.is_main_process():
             for fpath in TRACES_SAVE_DIR.glob("*.json"):
                 profile_art = wandb.Artifact(f"trace-{wandb.run.id}-{fpath.stem}", type="profile")
-                profile_art.add_file(str(fpath), "trace.pt.trace.json")
+                profile_art.add_file(str(fpath), f"{fpath.stem}.trace.pt.trace.json")
                 wandb.log_artifact(profile_art)
             
     except Exception as e:
