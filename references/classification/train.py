@@ -1,3 +1,6 @@
+"""based on torch/vision/references/classification/train.py"""
+
+
 import datetime
 import os
 import time
@@ -13,7 +16,9 @@ from sampler import RASampler
 from torch import nn
 from torch.utils.data.dataloader import default_collate
 from torchvision.transforms.functional import InterpolationMode
+import wandb
 
+from pathlib import Path
 
 try:
     from torchvision import prototype
@@ -62,6 +67,7 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, arg
         metric_logger.meters["acc1"].update(acc1.item(), n=batch_size)
         metric_logger.meters["acc5"].update(acc5.item(), n=batch_size)
         metric_logger.meters["img/s"].update(batch_size / (time.time() - start_time))
+    return {"loss": metric_logger.loss.global_avg, "acc1": metric_logger.acc1.global_avg, "acc5": metric_logger.acc5.global_avg}
 
 
 def evaluate(model, criterion, data_loader, device, print_freq=100, log_suffix=""):
@@ -104,7 +110,8 @@ def evaluate(model, criterion, data_loader, device, print_freq=100, log_suffix="
     metric_logger.synchronize_between_processes()
 
     print(f"{header} Acc@1 {metric_logger.acc1.global_avg:.3f} Acc@5 {metric_logger.acc5.global_avg:.3f}")
-    return metric_logger.acc1.global_avg
+    # return metric_logger.acc1.global_avg
+    return {"acc1": metric_logger.acc1.global_avg, "acc5": metric_logger.acc5.global_avg, "loss": metric_logger.loss.global_avg}
 
 
 def _get_cache_path(filepath):
@@ -353,9 +360,9 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args, model_ema, scaler)
+        train_metrics = train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args, model_ema, scaler)
         lr_scheduler.step()
-        evaluate(model, criterion, data_loader_test, device=device)
+        val_metrics = evaluate(model, criterion, data_loader_test, device=device)
         if model_ema:
             evaluate(model_ema, criterion, data_loader_test, device=device, log_suffix="EMA")
         if args.output_dir:
@@ -370,9 +377,15 @@ def main(args):
                 checkpoint["model_ema"] = model_ema.state_dict()
             if scaler:
                 checkpoint["scaler"] = scaler.state_dict()
-            utils.save_on_master(checkpoint, os.path.join(args.output_dir, f"model_{epoch}.pth"))
+            utils.save_on_master(checkpoint, os.path.join(args.output_dir, f"model_{epoch:06d}.pth"))
             utils.save_on_master(checkpoint, os.path.join(args.output_dir, "checkpoint.pth"))
-
+        
+        wandb.log({
+            "epoch": epoch, "lr": optimizer.param_groups[0]["lr"], 
+            **{f"train/{k}": v for k, v in train_metrics.items()},
+            **{f"val/{k}": v for k, v in val_metrics.items()},
+        })
+        
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print(f"Training time {total_time_str}")
@@ -508,7 +521,51 @@ def get_args_parser(add_help=True):
 
     return parser
 
+def get_extension_parser():
+    import argparse
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--wandb_entity", required=True, type=str, help="the wandb entity name")
+    parser.add_argument("--wandb_project", required=True, type=str, help="the wandb project name")
+    parser.add_argument("--wandb_group", required=True, type=str, help="the wandb group name")
+    parser.add_argument("--wandb_dir", required=True, type=Path, help="the wandb directory")
+    parser.add_argument("--wandb_tags", type=str, help="the wandb tags", nargs="+")
+    parser.add_argument("--seed", required=True, type=int, help="seed for initializing training. ")
+    return parser
+
 
 if __name__ == "__main__":
-    args = get_args_parser().parse_args()
-    main(args)
+    args, extension_args = get_args_parser().parse_known_args()
+    
+    extension_args = get_extension_parser().parse_args(extension_args)
+    print(f"extension_args: {extension_args}")
+    
+    torch.manual_seed(extension_args.seed)
+    
+    extension_args.wandb_dir.mkdir(parents=True, exist_ok=True)
+    extension_args.wandb_dir = str(extension_args.wandb_dir)
+    
+    wandb.init(
+        job_type=f"train-model={args.model}",
+        project=extension_args.wandb_project,
+        group=extension_args.wandb_group,
+        entity=extension_args.wandb_entity,
+        dir=extension_args.wandb_dir,
+        tags=extension_args.wandb_tags,
+        config=dict(**vars(args), **vars(extension_args)),
+        mode="online",
+    ) 
+    
+    checkpoints_dir = Path(wandb.run.dir) / "checkpoints"
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    wandb.save(str(checkpoints_dir / f"model*.pth"))   
+    args.output_dir = str(checkpoints_dir) 
+    
+    try:
+        main(args)
+        
+    except Exception as e:
+        wandb.finish(1)
+        raise
+
+    else:
+        wandb.finish(0)
