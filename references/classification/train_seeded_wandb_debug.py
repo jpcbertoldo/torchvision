@@ -17,8 +17,7 @@ from torch import nn
 from torch.utils.data.dataloader import default_collate
 from torchvision.transforms.functional import InterpolationMode
 import wandb
-import torch.profiler
-from torch.profiler import ProfilerActivity
+import torch.distributed as dist
 
 from pathlib import Path
 
@@ -26,25 +25,13 @@ try:
     from torchvision import prototype
 except ImportError:
     prototype = None
-    
-    
-MAX_BATCHES_PER_EPOCH = 10
 
 
-def save_trace(epoch):
-    
-    if not utils.is_main_process():
-        return
-    
-    global TRACES_SAVE_DIR 
-    
-    if TRACES_SAVE_DIR is None or not TRACES_SAVE_DIR.exists():
-        raise RuntimeError("TRACES_SAVE_DIR is not set")
-    
-    def func(prof):
-        prof.export_chrome_trace(str(TRACES_SAVE_DIR / f"trace_epoch_{epoch:06d}.json"))
+def dummy(*a, **k):
+    pass
 
-    return func
+# hacking this so i can see prints from all ranks
+utils.setup_for_distributed = dummy
 
 
 def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args, model_ema=None, scaler=None):
@@ -53,60 +40,42 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, arg
     metric_logger.add_meter("lr", utils.SmoothedValue(window_size=1, fmt="{value}"))
     metric_logger.add_meter("img/s", utils.SmoothedValue(window_size=10, fmt="{value}"))
 
-    with torch.profiler.profile(
-        activities=[
-            ProfilerActivity.CPU,
-            ProfilerActivity.CUDA,
-        ],
-        on_trace_ready=save_trace(epoch),
-        schedule=torch.profiler.schedule(wait=0, warmup=(warmup := 5), active=MAX_BATCHES_PER_EPOCH-warmup),
-        with_stack=False,
-        profile_memory=False,
-        record_shapes=False,
-        with_flops=False,
-    ) as p:
+    header = f"Epoch: [{epoch}]"
+    for i, (image, target) in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
+        start_time = time.time()
+        print(f"rank {dist.get_rank()} epoch {epoch} \n{image[0]}")
+        image, target = image.to(device), target.to(device)
+        with torch.cuda.amp.autocast(enabled=scaler is not None):
+            output = model(image)
+            loss = criterion(output, target)
 
-        header = f"Epoch: [{epoch}]"
-        for i, (image, target) in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
-        
-            start_time = time.time()
-            image, target = image.to(device), target.to(device)
-            with torch.cuda.amp.autocast(enabled=scaler is not None):
-                output = model(image)
-                loss = criterion(output, target)
+        optimizer.zero_grad()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            if args.clip_grad_norm is not None:
+                # we should unscale the gradients of optimizer's assigned params if do gradient clipping
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            if args.clip_grad_norm is not None:
+                nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
+            optimizer.step()
 
-            optimizer.zero_grad()
-            if scaler is not None:
-                scaler.scale(loss).backward()
-                if args.clip_grad_norm is not None:
-                    # we should unscale the gradients of optimizer's assigned params if do gradient clipping
-                    scaler.unscale_(optimizer)
-                    nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                if args.clip_grad_norm is not None:
-                    nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
-                optimizer.step()
+        if model_ema and i % args.model_ema_steps == 0:
+            model_ema.update_parameters(model)
+            if epoch < args.lr_warmup_epochs:
+                # Reset ema buffer to keep copying weights during warmup period
+                model_ema.n_averaged.fill_(0)
 
-            if model_ema and i % args.model_ema_steps == 0:
-                model_ema.update_parameters(model)
-                if epoch < args.lr_warmup_epochs:
-                    # Reset ema buffer to keep copying weights during warmup period
-                    model_ema.n_averaged.fill_(0)
-
-            acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
-            batch_size = image.shape[0]
-            metric_logger.update(loss=loss.item(), lr=optimizer.param_groups[0]["lr"])
-            metric_logger.meters["acc1"].update(acc1.item(), n=batch_size)
-            metric_logger.meters["acc5"].update(acc5.item(), n=batch_size)
-            metric_logger.meters["img/s"].update(batch_size / (time.time() - start_time))
-            
-            p.step()
-            
-            if MAX_BATCHES_PER_EPOCH > 0 and i >= MAX_BATCHES_PER_EPOCH - 1:
-                break
+        acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
+        batch_size = image.shape[0]
+        metric_logger.update(loss=loss.item(), lr=optimizer.param_groups[0]["lr"])
+        metric_logger.meters["acc1"].update(acc1.item(), n=batch_size)
+        metric_logger.meters["acc5"].update(acc5.item(), n=batch_size)
+        metric_logger.meters["img/s"].update(batch_size / (time.time() - start_time))
     return {"loss": metric_logger.loss.global_avg, "acc1": metric_logger.acc1.global_avg, "acc5": metric_logger.acc5.global_avg}
 
 
@@ -402,7 +371,7 @@ def main(args):
             train_sampler.set_epoch(epoch)
         train_metrics = train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args, model_ema, scaler)
         lr_scheduler.step()
-        # val_metrics = evaluate(model, criterion, data_loader_test, device=device)
+        val_metrics = evaluate(model, criterion, data_loader_test, device=device)
         if model_ema:
             evaluate(model_ema, criterion, data_loader_test, device=device, log_suffix="EMA")
         if args.output_dir:
@@ -423,7 +392,7 @@ def main(args):
         wandb.log({
             "epoch": epoch, "lr": optimizer.param_groups[0]["lr"], 
             **{f"train/{k}": v for k, v in train_metrics.items()},
-            # **{f"val/{k}": v for k, v in val_metrics.items()},
+            **{f"val/{k}": v for k, v in val_metrics.items()},
         })
         
     total_time = time.time() - start_time
@@ -592,31 +561,20 @@ if __name__ == "__main__":
         dir=extension_args.wandb_dir,
         tags=extension_args.wandb_tags,
         config=dict(**vars(args), **vars(extension_args)),
-        mode="online",
+        mode="offline",
     ) 
     
     checkpoints_dir = Path(wandb.run.dir) / "checkpoints"
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
-    wandb.save(str(checkpoints_dir / f"model*.pth"))   
+    # wandb.save(str(checkpoints_dir / f"model*.pth"))   
     args.output_dir = str(checkpoints_dir) 
-    
-    global TRACES_SAVE_DIR
-    TRACES_SAVE_DIR = Path(wandb.run.dir) / "traces"
-    TRACES_SAVE_DIR.mkdir(parents=True, exist_ok=True)
-    # wandb.save(str(TRACES_SAVE_DIR / f"*.json"))
     
     try:
         main(args)
-        if utils.is_main_process():
-            for fpath in TRACES_SAVE_DIR.glob("*.json"):
-                profile_art = wandb.Artifact(f"trace-{wandb.run.id}", type="profile")
-                profile_art.add_file(str(fpath), f"trace.pt.trace.json")
-                wandb.log_artifact(profile_art)
-            
+        
     except Exception as e:
         wandb.finish(1)
         raise
 
     else:
         wandb.finish(0)
-        
